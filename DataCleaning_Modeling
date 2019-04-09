@@ -1,0 +1,203 @@
+library(dplyr)
+library(tidyr)
+library(openxlsx)
+library("e1071")
+library(ROSE)
+library(tm)
+library(tibble)
+library(openxlsx)
+library(zoo)
+library(caret)
+
+data_path1 <- "~/02_EatFit_Export_products.txt"
+data_path2 <- "~/02_EatFit_minor-categories.csv"
+str_data <- readLines(data_path1)
+str_class <- readLines(data_path2)
+
+#Process the data of the feature data 
+gener_dataTbl <- read.csv(text = str_data, sep ="\t", header = TRUE, stringsAsFactors=TRUE, comment.char = "", quote="\"")
+data_table <- gener_dataTbl %>% select(major_category_id,minor_category_id,product_size_unit_of_measure,allergenMilk,ingredient_de)
+data  <- data.frame(data_table)
+
+#Process the data of class data
+class_table <- read.csv(text = str_class, sep =";", header = TRUE, stringsAsFactors=TRUE, comment.char = "", quote="\"")
+temp_class <- class_table %>% select(category_minor_id,category_major_id,name_en,Classified)
+names(temp_class) <- c("minor_category_id","major_category_id","Name","Class")
+class <- data.frame(temp_class)
+class$Class <- gsub('\\s+', '', class$Class)
+class$Class <- ifelse(grepl('Oil|AddedFats', class$Class, ignore.case = T), 'Oil', class$Class)
+
+new_table <- merge(data,class,by = c("minor_category_id","major_category_id"))
+new_table$Class <- gsub('\\s+', '', new_table$Class)
+new_table <- new_table[-c(1:2)]
+new_table$allergenMilk <- as.integer(as.logical(new_table$allergenMilk))
+new_table$Class <- as.factor(new_table$Class)
+new_table[new_table == "NULL"] = NA
+
+temp_Oil <- new_table %>% filter(Class == 'Oil') %>% filter(Name != 'Cream')
+temp_Oil$ingredient_en <- ifelse(is.na(temp_Oil$ingredient_en), as.character(temp_Oil$Name), as.character(temp_Oil$ingredient_en))
+temp_Oil <- temp_Oil %>% fill(allergenMilk) %>% arrange(desc(ingredient_en)) %>% mutate(allergenMilk = na.locf(allergenMilk))
+temp_Oil$ingredient_en <- ifelse(temp_Oil$ingredient_en == '-', as.character(temp_Oil$Name), as.character(temp_Oil$ingredient_en))
+temp_Oil$ingredient_en <- ifelse(temp_Oil$ingredient_en == '', as.character(temp_Oil$Name), as.character(temp_Oil$ingredient_en))
+temp_Oil$ingredient_en <- ifelse(grepl("Olive", temp_Oil$ingredient_en,ignore.case = TRUE), "Olive", temp_Oil$ingredient_en)
+temp_Oil$ingredient_en <- ifelse(grepl("Butter", temp_Oil$ingredient_en,ignore.case = TRUE), "Butter", temp_Oil$ingredient_en)
+temp_Oil$ingredient_en <- ifelse(grepl("Oil", temp_Oil$ingredient_en,ignore.case = TRUE), "Oil", temp_Oil$ingredient_en)
+
+corpus_train <- Corpus(VectorSource(temp_Oil$ingredient_en))
+tdm_train <- DocumentTermMatrix(corpus_train,list(removePunctuations = FALSE, removeNumbers = TRUE))
+temp_Oil_set <- as.matrix(tdm_train)
+
+
+temp_Cheese <- new_table %>% filter(Class == 'Cheese')
+temp_Cheese$ingredient_en <- ifelse(is.na(temp_Cheese$ingredient_en), as.character(temp_Cheese$Name), as.character(temp_Cheese$ingredient_en))
+temp_Cheese <- temp_Cheese %>% arrange(desc(Name)) %>% mutate(ingredient_en = Name) 
+temp_Cheese$allergenMilk <- 1
+temp_Cheese<- drop_na(temp_Cheese)
+
+temp_Beverage <- new_table %>% filter(Class == 'Beverage')
+temp_Beverage$ingredient_en <- ifelse(is.na(temp_Beverage$ingredient_en), as.character(temp_Beverage$Name), as.character(temp_Beverage$ingredient_en))
+temp_Beverage <- temp_Beverage %>% arrange(desc(ingredient_en)) %>% mutate(allergenMilk = na.locf(allergenMilk))
+temp_Beverage$ingredient_en <- ifelse(temp_Beverage$ingredient_en == '', as.character(temp_Beverage$Name), as.character(temp_Beverage$ingredient_en))
+temp_Beverage<- drop_na(temp_Beverage)
+
+
+temp_Food <- new_table %>% filter(Class == 'Food')
+temp_Food$ingredient_en <- ifelse(is.na(temp_Food$ingredient_en), as.character(temp_Food$Name), as.character(temp_Food$ingredient_en))
+temp_Food<- drop_na(temp_Food)
+
+#Balance the data 
+tmp_cheese<- temp_Cheese %>% rbind(temp_Food)
+data_balanced_over_cheese <- ovun.sample(Class ~ ., data = tmp_cheese, method = "over",N = 3394)$data
+Cheese <- data_balanced_over_cheese %>% filter(Class=="Cheese")
+
+tmp_oil <- temp_Oil %>% rbind(temp_Food)
+data_balanced_over_oil <- ovun.sample(Class ~ ., data = tmp_oil, method = "over",N = 3394)$data
+Oil <- data_balanced_over_oil %>% filter(Class=="Oil")
+
+tmp_beverage <- temp_Beverage %>% rbind(temp_Food)
+data_balanced_over_beverage <- ovun.sample(Class ~ ., data = tmp_beverage, method = "over",N = 3394)$data
+Beverage <- data_balanced_over_beverage %>% filter(Class=="Beverage")
+
+Data_Table <- rbind(temp_Food,Cheese,Beverage,Oil)
+Data_Table$Class<-as.factor(Data_Table$Class)
+#Data_Table$ingredient_en<- strtrim(Data_Table$ingredient_en, 16)
+#Data_Table$Name<-strtrim(Data_Table$Name, 10)
+
+#create a corputs(Document Term Matrix DTM)
+Data_Table <- subset(Data_Table,select = c("ingredient_en",'Class'))
+d = sort(sample(nrow(Data_Table), nrow(Data_Table)*0.7))
+train<-Data_Table[d,]
+test<-Data_Table[-d,]
+
+train.x = subset(train,select = -Class)
+train.x<- as.character(train.x[,1])
+train.y = train$Class
+test_x <- subset(test,select = -Class)
+test_x<- as.character(test_x[,1])
+test_y <- test$Class
+
+#clean data 
+clean_corpus <- function(corpus){
+  corpus <- tm_map(corpus, removePunctuation)
+  corpus <- tm_map(corpus,removeNumbers)
+  corpus <- tm_map(corpus, content_transformer(tolower))
+  corpus <- tm_map(corpus, removeWords, c(stopwords("en"), "sweet", "soft"))
+  corpus <- tm_map(corpus,stemDocument)
+  corpus <- tm_map(corpus, stripWhitespace)
+  corpus <- DocumentTermMatrix(corpus)
+  return(corpus)
+}
+
+corpus_train <- Corpus(VectorSource(train.x))
+tdm_train <- clean_corpus(corpus_train)
+train_set <- as.matrix(tdm_train) %>% cbind(as.character(train.y))
+colnames(train_set)[ncol(train_set)] <- "y"
+
+#build a NB model 
+NB_model <- train(y ~., data = train_set, method = 'nb')
+
+#build a svm model
+svm_tm <- train(y ~., data = train_set, method = 'svmLinear3')
+predict(svm_tm, newdata = train_set)
+
+#test data 
+corpus_test <- Corpus(VectorSource(test_x))
+tdm_test <- DocumentTermMatrix(corpus_test,list(removePunctuations = TRUE, removeNumbers = TRUE))
+test_set <- as.matrix(tdm_test) 
+#%>% cbind(as.factor(test_y))
+colnames(test_set)[ncol(test_set)] <- "y"
+
+#check accuracy on test
+test_set <- subset(test_set,select = c(colnames(train_set)))
+predict(svm_tm,newdata = test_set)
+confusionMatrix <- table(pred,test_y)
+sum(diag(confusionMatrix)/sum(confusionMatrix))
+
+-------------------------------------------------------------------------------------------------------
+library(RTextTools)
+
+Data_Table_x <- subset(Data_Table,select = -Class)
+Data_Table_y <- Data_Table$Class
+
+product_review_matrix <- create_matrix(Data_Table_x, language = "English", 
+                                       removeNumbers = TRUE, 
+                                       removePunctuation = TRUE, 
+                                       removeStopwords = FALSE, stemWords = FALSE)
+
+d = sort(sample(nrow(Data_Table), nrow(Data_Table)*0.7))
+train<-Data_Table[d,]
+test<-Data_Table[-d,]
+test_x <- subset(test,select = -Class)
+test_y <- test$Class
+
+product_review_container <- create_container(product_review_matrix,
+                                             product_review$rating_new, 
+                                             trainSize = train, testSize = test_x, 
+                                             virgin = FALSE)
+
+product_review_model <- train_model(product_review_container, algorithm = "SVM")
+
+product_review_model_result <- classify_model(product_review_container, product_review_model)
+
+analytics = create_analytics(product_review_container, product_review_model_result)
+summary(analytics)
+
+test_result <- as.data.frame(cbind(test_y, product_review_model_result$SVM_LABEL))
+colnames(test_result) <- c("actual_ratings", "predicted_ratings")
+round(prop.table(table(x$actual_ratings == x$predicted_ratings)), 3)
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
